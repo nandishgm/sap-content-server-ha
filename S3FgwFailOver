@@ -1,8 +1,8 @@
 #!/usr/bin/sh
 #
 # Auto-generated OCF Resource Agent
-# Generated: Fri Jul 18 15:38:35 UTC 2025
-# Commit: 0919a8be475be3c269f4b82eceeae203c99299fc
+# Generated: Tue Oct 28 08:50:35 UTC 2025
+# Commit: f093f1bf685432ec4087829485ff97a2875b1e9c
 #
 
 # === 01-header.sh ===
