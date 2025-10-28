@@ -1,0 +1,593 @@
+#!/usr/bin/sh
+#
+# Auto-generated OCF Resource Agent
+# Generated: Fri Jul 18 15:38:35 UTC 2025
+# Commit: 0919a8be475be3c269f4b82eceeae203c99299fc
+#
+
+# === 01-header.sh ===
+#!/usr/bin/sh
+#
+# OCF resource agent for S3 File Gateway failover management
+# Copyright (c) 2024
+# All Rights Reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Defaults
+OCF_RESKEY_target_group_name_default=""
+OCF_RESKEY_ssm_param_name_default=""
+
+: ${OCF_RESKEY_target_group_name=${OCF_RESKEY_target_group_name_default}}
+: ${OCF_RESKEY_ssm_param_name=${OCF_RESKEY_ssm_param_name_default}}
+
+#######################################################################
+
+USAGE="usage: $0 {start|stop|monitor|validate-all|meta-data}";
+# === 02-metadata.sh ===
+metadata() {
+    cat <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="S3FgwFailOver">
+<version>1.0</version>
+<longdesc lang="en">
+Resource agent for managing S3 file gateways in an NLB target
+</longdesc>
+<shortdesc lang="en">SAP File Gateway HA failover manager</shortdesc>
+<parameters>
+    <parameter name="target_group_name" required="1">
+    <longdesc lang="en">Name of the NLB target group</longdesc>
+    <shortdesc lang="en">Target group name</shortdesc>
+    <content type="string"/>
+    </parameter>
+    <parameter name="ssm_param_name" required="1">
+    <longdesc lang="en">Name of the SSM parameter containing file gateways instance-az mapping</longdesc>
+    <shortdesc lang="en">SSM parameter name</shortdesc>
+    <content type="string"/>
+    </parameter>
+</parameters>
+<actions>
+    <action name="start"   timeout="300s"/>
+    <action name="stop"    timeout="300s"/>
+    <action name="monitor" timeout="120s" interval="10s"/>
+    <action name="meta-data"  timeout="10s"/>
+    <action name="validate-all"  timeout="10s"/>
+</actions>
+</resource-agent>
+EOF
+}
+# === 03-validation.sh ===
+s3fgw_validate() {
+    # Check for required binaries
+    for cmd in aws curl jq; do
+        check_binary "$cmd"
+    done
+
+    # Check for required parameters
+    if [ -z "$OCF_RESKEY_target_group_name" ]; then
+        ocf_exit_reason "target_group_name parameter not set"
+        return $OCF_ERR_CONFIGURED
+    fi
+    if [ -z "$OCF_RESKEY_ssm_param_name" ]; then
+        ocf_exit_reason "ssm_param_name parameter not set"
+        return $OCF_ERR_CONFIGURED
+    fi
+    
+    # Perform detailed dependency check
+    s3fgw_check_dependencies
+    if [ $? -ne $OCF_SUCCESS ]; then
+        ocf_exit_reason "Dependency check failed"
+        return $OCF_ERR_INSTALLED
+    fi
+    
+    return $OCF_SUCCESS
+}
+# === 03a-dependencies.sh ===
+s3fgw_check_dependencies() {
+    local missing_deps=0
+    local aws_version
+    local jq_version
+    local curl_version
+    
+    # Check for AWS CLI
+    if ! aws --version >/dev/null 2>&1; then
+        ocf_log error "AWS CLI is not installed or not in PATH"
+        missing_deps=1
+    else
+        aws_version=$(aws --version 2>&1)
+        ocf_log info "Found AWS CLI: $aws_version"
+    fi
+    
+    # Check for jq
+    if ! jq --version >/dev/null 2>&1; then
+        ocf_log error "jq is not installed or not in PATH"
+        missing_deps=1
+    else
+        jq_version=$(jq --version 2>&1)
+        ocf_log info "Found jq: $jq_version"
+    fi
+    
+    # Check for curl
+    if ! curl --version >/dev/null 2>&1; then
+        ocf_log error "curl is not installed or not in PATH"
+        missing_deps=1
+    else
+        curl_version=$(curl --version 2>&1 | head -n 1)
+        ocf_log info "Found curl: $curl_version"
+    fi
+    
+    # Check AWS CLI configuration
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+        ocf_log warn "AWS CLI is not properly configured or lacks permissions"
+        ocf_log warn "Make sure AWS credentials are available and have required permissions"
+    fi
+    
+    if [ $missing_deps -eq 1 ]; then
+        ocf_log error "Missing required dependencies. Please install them before using this resource agent."
+        return $OCF_ERR_INSTALLED
+    fi
+    
+    return $OCF_SUCCESS
+}
+# === 04-aws-metadata.sh ===
+s3fgw_get_current_az() {
+    local token
+    local current_az
+
+    token=$(curl -s -f -X PUT "http://169.254.169.254/latest/api/token" \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") || {
+        ocf_log error "Failed to retrieve IMDSv2 token"
+        return $OCF_ERR_GENERIC
+    }
+
+    current_az=$(curl -s -f -H "X-aws-ec2-metadata-token: $token" \
+        "http://169.254.169.254/latest/meta-data/placement/availability-zone") || {
+        ocf_log error "Failed to retrieve availability zone"
+        return $OCF_ERR_GENERIC
+    }
+
+    echo "$current_az"
+    return $OCF_SUCCESS
+}
+
+s3fgw_get_ec2_instance_id() {
+    local az=$1
+    local ssm_param_value
+    local instance_id
+    local instance_state
+
+    if [ -z "$az" ]; then
+        ocf_log error "No availability zone provided"
+        return $OCF_ERR_ARGS
+    fi
+
+    if [ -z "$OCF_RESKEY_ssm_param_name" ]; then
+        ocf_log error "ssm_param_name is not set"
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    ssm_param_value=$(aws ssm get-parameter \
+        --name "$OCF_RESKEY_ssm_param_name" \
+        --query 'Parameter.Value' \
+        --output text 2>&1) || {
+        ocf_log error "Failed to retrieve SSM parameter '$OCF_RESKEY_ssm_param_name': $ssm_param_value"
+        return $OCF_ERR_GENERIC
+    }
+
+    if ! echo "$ssm_param_value" | jq -e '.[] | select(has("'$az'"))' >/dev/null 2>&1; then
+        ocf_log error "No mapping found for AZ '$az' in parameter '$OCF_RESKEY_ssm_param_name'"
+        ocf_log error "Available mappings: $(echo "$ssm_param_value" | jq -r 'keys[]')"
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    instance_id=$(echo "$ssm_param_value" | jq -r '.[] | select(has("'$az'")) | .["'$az'"]' | tr -d ' ')
+
+    instance_state=$(aws ec2 describe-instances \
+        --instance-ids "$instance_id" \
+        --query 'Reservations[].Instances[].State.Name' \
+        --output text 2>&1) || {
+        ocf_log error "Failed to verify instance state: $instance_state"
+        return $OCF_ERR_GENERIC
+    }
+
+    if [ "$instance_state" != "running" ]; then
+        ocf_log error "Instance $instance_id is not running (current state: $instance_state)"
+        return $OCF_FAILED
+    fi
+
+    s3fgw_refresh_file_share_cache "${instance_id}" > /dev/null 2>&1 &
+
+    echo $instance_id
+    return $OCF_SUCCESS
+}
+# === 05-storage-gateway.sh ===
+s3fgw_refresh_file_share_cache() {
+    local instance_id=$1
+    local gateway_arn
+    local file_shares
+
+    gateway_arn=$(aws storagegateway list-gateways --query "Gateways[?Ec2InstanceId=='${instance_id}'].GatewayARN" --output text)
+
+    if [ -z "$gateway_arn" ]; then
+        ocf_log error "No Storage Gateway found for EC2 instance ${instance_id}"
+        return $OCF_ERR_GENERIC
+    fi
+
+    file_shares=$(aws storagegateway list-file-shares --gateway-arn "${gateway_arn}" --query "FileShareInfoList[].FileShareARN" --output text)
+
+    if [ -z "$file_shares" ]; then
+        ocf_log warn "No file shares found for gateway ${gateway_arn}"
+        return $OCF_SUCCESS
+    fi
+
+    for share_arn in $file_shares; do
+        (
+            ocf_log info "Starting cache refresh for file share ${share_arn}"
+            aws storagegateway refresh-cache --file-share-arn "${share_arn}"
+
+            if [ $? -eq 0 ]; then
+                ocf_log info "Successfully initiated cache refresh for file share ${share_arn}"
+            else
+                ocf_log warn "Failed to refresh cache for file share ${share_arn}"
+            fi
+        ) &
+    done
+
+    return $OCF_SUCCESS
+}
+# === 06-nlb-management.sh ===
+s3fgw_get_target_group_arn() {
+    local target_group_name="$1"
+    local target_group_arn
+
+    if [ -z "$target_group_name" ]; then
+        ocf_log error "Target group name not provided"
+        return $OCF_ERR_ARGS
+    fi
+
+    target_group_arn=$(aws elbv2 describe-target-groups \
+        --names "$target_group_name" \
+        --query 'TargetGroups[0].TargetGroupArn' \
+        --output text)
+
+    if [ $? -ne 0 ]; then
+        ocf_log error "Failed to describe target group"
+        return $OCF_ERR_GENERIC
+    fi
+
+    if [ -z "$target_group_arn" ] || [ "$target_group_arn" = "None" ]; then
+        ocf_log error "Failed to get target group ARN for: $target_group_name"
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    echo "$target_group_arn"
+    return $OCF_SUCCESS
+}
+
+s3fgw_deregister_targets() {
+    local target_group_arn=$1
+    local targets
+    local max_attempts=15
+    local attempt=1
+    local remaining_targets
+
+    targets=$(aws elbv2 describe-target-health --target-group-arn "$target_group_arn" --query 'TargetHealthDescriptions[*].Target.Id' --output text)
+
+    if [ $? -ne 0 ]; then
+        ocf_log error "Failed to describe target health"
+        return $OCF_ERR_GENERIC
+    fi
+
+    if [ -n "$targets" ]; then
+        ocf_log info "Deregistering targets: $targets"
+        aws elbv2 deregister-targets --target-group-arn "$target_group_arn" --targets $(echo $targets | sed 's/ / Id=/g; s/^/Id=/')
+
+        if [ $? -ne 0 ]; then
+            ocf_log error "Failed to deregister targets"
+            return $OCF_ERR_GENERIC
+        fi
+
+        while [ $attempt -le $max_attempts ]; do
+            remaining_targets=$(aws elbv2 describe-target-health \
+                --target-group-arn "$target_group_arn" \
+                --query 'length(TargetHealthDescriptions[?TargetHealth.State!=`unused`])' \
+                --output text)
+
+            if [ $? -ne 0 ]; then
+                ocf_log error "Failed to check remaining targets"
+                return $OCF_ERR_GENERIC
+            fi
+
+            if [ "$remaining_targets" -eq 0 ]; then
+                ocf_log info "All targets successfully deregistered"
+                return $OCF_SUCCESS
+            fi
+
+            ocf_log info "Waiting for targets to complete draining (attempt $attempt/$max_attempts)"
+            sleep 10
+            ((attempt++))
+        done
+
+        ocf_log warn "Targets did not complete draining within timeout"
+        return $OCF_PENDING
+    else
+        ocf_log info "No targets to deregister"
+        return $OCF_SUCCESS
+    fi
+}
+
+s3fgw_register_target() {
+    local instance_id=$1
+    local target_group_arn=$2
+
+    if [ -z "$instance_id" ] || [ -z "$target_group_arn" ]; then
+        ocf_log error "Missing instance ID or target group ARN"
+        return $OCF_ERR_ARGS
+    fi
+
+    ocf_log info "Registering target: $instance_id"
+    aws elbv2 register-targets --target-group-arn "$target_group_arn" --targets Id=$instance_id
+
+    if [ $? -ne 0 ]; then
+        ocf_log error "Failed to register target $instance_id"
+        return $OCF_ERR_GENERIC
+    fi
+
+    return $OCF_SUCCESS
+}
+
+s3fgw_wait_for_target_health() {
+    local instance_id=$1
+    local target_group_arn=$2
+    local max_attempts=30
+    local attempt=1
+    local health
+
+    if [ -z "$instance_id" ] || [ -z "$target_group_arn" ]; then
+        ocf_log error "Missing instance ID or target group ARN"
+        return $OCF_ERR_ARGS
+    fi
+
+    while [ $attempt -le $max_attempts ]; do
+        health=$(aws elbv2 describe-target-health --target-group-arn "$target_group_arn" --targets Id=$instance_id --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text)
+
+        if [ $? -ne 0 ]; then
+            ocf_log error "Failed to check target health"
+            return $OCF_ERR_GENERIC
+        fi
+
+        if [ "$health" = "healthy" ]; then
+            ocf_log info "Target $instance_id is healthy"
+            return $OCF_SUCCESS
+        elif [ "$health" = "unhealthy" ]; then
+            ocf_log warn "Target $instance_id is unhealthy (attempt $attempt/$max_attempts)"
+        elif [ "$health" = "initial" ]; then
+            ocf_log info "Target $instance_id is in initial state (attempt $attempt/$max_attempts)"
+        elif [ "$health" = "draining" ]; then
+            ocf_log warn "Target $instance_id is draining (attempt $attempt/$max_attempts)"
+        else
+            ocf_log warn "Target $instance_id has unknown health state: $health (attempt $attempt/$max_attempts)"
+        fi
+
+        sleep 10
+        ((attempt++))
+    done
+
+    ocf_log error "Target $instance_id failed to become healthy after $max_attempts attempts"
+    return $OCF_FAILED
+}
+
+s3fgw_check_target_health() {
+    local target_group_arn=$1
+    local targets_health
+    local healthy_count
+    local initial_count
+    local draining_count
+    local unhealthy_count
+
+    if [ -z "$target_group_arn" ]; then
+        ocf_log error "Missing target group ARN"
+        return $OCF_ERR_ARGS
+    fi
+
+    targets_health=$(aws elbv2 describe-target-health \
+        --target-group-arn "$target_group_arn" \
+        --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \
+        --output json)
+
+    if [ $? -ne 0 ]; then
+        ocf_log error "Failed to describe target health"
+        return $OCF_ERR_GENERIC
+    fi
+
+    if [ -z "$targets_health" ] || [ "$targets_health" = "[]" ]; then
+        ocf_log info "No targets found - Resource is STOPPED"
+        return $OCF_NOT_RUNNING
+    fi
+
+    healthy_count=$(echo "$targets_health" | jq '[.[] | select(.[1] == "healthy")] | length')
+    initial_count=$(echo "$targets_health" | jq '[.[] | select(.[1] == "initial")] | length')
+    draining_count=$(echo "$targets_health" | jq '[.[] | select(.[1] == "draining")] | length')
+    unhealthy_count=$(echo "$targets_health" | jq '[.[] | select(.[1] == "unhealthy")] | length')
+
+    if [ "$healthy_count" -eq 1 ]; then
+        ocf_log info "One healthy target found - Resource is RUNNING"
+        return $OCF_SUCCESS
+    elif [ "$initial_count" -gt 0 ]; then
+        ocf_log info "Target(s) in initial state - Resource is STARTING"
+        return $OCF_PENDING
+    elif [ "$draining_count" -gt 0 ]; then
+        ocf_log info "Target(s) in draining state - Resource is STOPPING"
+        return $OCF_PENDING
+    elif [ "$unhealthy_count" -gt 0 ]; then
+        ocf_log error "Target(s) in unhealthy state - Resource has FAILED"
+        return $OCF_FAILED
+    else
+        ocf_log error "No healthy targets - Resource has FAILED"
+        return $OCF_FAILED
+    fi
+}
+# === 07-resource-actions.sh ===
+s3fgw_start() {
+    local target_group_arn
+    local current_az
+    local instance_id
+    local rc
+
+    ocf_log info "Starting resource"
+
+    target_group_arn=$(s3fgw_get_target_group_arn "$OCF_RESKEY_target_group_name")
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        ocf_log error "Failed to get target group ARN"
+        return $rc
+    fi
+
+    current_az=$(s3fgw_get_current_az)
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        ocf_log error "Failed to get current AZ"
+        return $rc
+    fi
+
+    instance_id=$(s3fgw_get_ec2_instance_id $current_az)
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        ocf_log error "Failed to get EC2 instance ID for AZ $current_az"
+        return $rc
+    fi
+
+    s3fgw_deregister_targets $target_group_arn
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ] && [ $rc -ne $OCF_PENDING ]; then
+        ocf_log error "Failed to deregister existing targets"
+        return $rc
+    fi
+
+    s3fgw_register_target $instance_id $target_group_arn
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        ocf_log error "Failed to register target $instance_id"
+        return $rc
+    fi
+
+    s3fgw_wait_for_target_health $instance_id $target_group_arn
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        ocf_log error "Target $instance_id failed to become healthy"
+        return $rc
+    fi
+
+    ocf_log info "Resource started successfully"
+    return $OCF_SUCCESS
+}
+
+s3fgw_monitor() {
+    local target_group_arn
+    local rc
+
+    ocf_log info "Monitoring resource"
+
+    target_group_arn=$(s3fgw_get_target_group_arn "$OCF_RESKEY_target_group_name")
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        ocf_log error "Failed to get target group ARN"
+        return $rc
+    fi
+
+    s3fgw_check_target_health $target_group_arn
+    rc=$?
+
+    case $rc in
+        $OCF_SUCCESS)
+            ocf_log info "Resource is running normally"
+            ;;
+        $OCF_NOT_RUNNING)
+            ocf_log info "Resource is not running"
+            ;;
+        $OCF_PENDING)
+            ocf_log info "Resource state is pending"
+            ;;
+        $OCF_FAILED)
+            ocf_log error "Resource has failed"
+            ;;
+        *)
+            ocf_log error "Unexpected return code from check_target_health: $rc"
+            ;;
+    esac
+
+    return $rc
+}
+
+s3fgw_stop() {
+    local target_group_arn
+    local rc
+
+    ocf_log info "Stopping resource"
+
+    target_group_arn=$(s3fgw_get_target_group_arn "$OCF_RESKEY_target_group_name")
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        ocf_log error "Failed to get target group ARN"
+        return $rc
+    fi
+
+    s3fgw_deregister_targets $target_group_arn
+    rc=$?
+    if [ $rc -ne $OCF_SUCCESS ] && [ $rc -ne $OCF_PENDING ]; then
+        ocf_log error "Failed to deregister targets"
+        return $rc
+    fi
+
+    ocf_log info "Resource stopped successfully"
+    return $OCF_SUCCESS
+}
+# === 08-main.sh ===
+###############################################################################
+#
+# MAIN
+#
+###############################################################################
+
+case $__OCF_ACTION in
+    meta-data)
+        metadata
+        exit $OCF_SUCCESS
+        ;;
+    usage|help)
+        echo $USAGE
+        exit $OCF_SUCCESS
+        ;;
+esac
+
+if ! ocf_is_root; then
+    ocf_log err "You must be root for $__OCF_ACTION operation."
+    exit $OCF_ERR_PERM
+fi
+
+s3fgw_validate
+
+case $__OCF_ACTION in
+    start)
+        s3fgw_start;;
+    stop)
+        s3fgw_stop;;
+    monitor)
+        s3fgw_monitor;;
+    validate-all)
+        exit $?;;
+    *)
+        echo $USAGE
+        exit $OCF_ERR_UNIMPLEMENTED
+        ;;
+esac

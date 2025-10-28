@@ -1,0 +1,19 @@
+resource_agent:
+  name: S3FgwFailOver
+  version: 1.0
+  
+assembly_order:
+  - 01-header.sh
+  - 02-metadata.sh
+  - 03-validation.sh
+  - 03a-dependencies.sh
+  - 04-aws-metadata.sh
+  - 05-storage-gateway.sh
+  - 06-nlb-management.sh
+  - 07-resource-actions.sh
+  - 08-main.sh
+
+validation:
+  shellcheck: true
+  syntax_check: true
+  ocf_compliance: true
