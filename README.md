@@ -139,22 +139,30 @@ pcs resource create S3GatewayHA ocf:heartbeat:S3FgwFailOver \
 
 ## Architecture
 
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│                 │     │                 │     │                 │
-│  SAP Cluster    │     │  Network Load   │     │  Storage        │
-│  Node 1 (AZ-a)  │────►┤  Balancer       │────►┤  Gateway 1      │
-│                 │     │                 │     │  (AZ-a)         │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                               │
-┌─────────────────┐            │            ┌─────────────────┐
-│                 │            │            │                 │
-│  SAP Cluster    │            └───────────►│  Storage        │
-│  Node 2 (AZ-b)  │                         │  Gateway 2      │
-│                 │                         │  (AZ-b)         │
-└─────────────────┘                         └─────────────────┘
+The S3FgwFailOver resource agent orchestrates failover between Storage Gateway instances across availability zones:
 
+```mermaid
+graph LR
+    A[SAP Cluster Node 1<br/>AZ-a] --> C[Network Load<br/>Balancer]
+    B[SAP Cluster Node 2<br/>AZ-b] -.-> C
+    C --> D[Storage Gateway 1<br/>AZ-a]
+    C -.-> E[Storage Gateway 2<br/>AZ-b]
+    
+    style A fill:#e1f5fe
+    style B fill:#e8f5e8
+    style C fill:#fff3e0
+    style D fill:#f3e5f5
+    style E fill:#f3e5f5
+```
 
-![alt text](image-1.png)
+**Flow:**
+1. Active SAP cluster node determines its availability zone
+2. Resource agent registers the corresponding Storage Gateway instance with the NLB
+3. NLB routes traffic to the healthy Storage Gateway in the same AZ
+4. During failover, the new active node registers its AZ's Storage Gateway
+5. File share caches are refreshed to ensure optimal performance
+
+![Architecture Diagram](images/simple-architecture.png)
 
 ## Cluster Integration
 
